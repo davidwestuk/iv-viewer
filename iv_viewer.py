@@ -551,11 +551,19 @@ def update_chart(selected_rows, _cell_changed, row_data):
 # Select the first grid row on initial load (visual highlight).
 # The grid's "selectedRows" is read-only as a prop, so we set it via the
 # grid API from the client once the grid has rendered.
+#
+# Guarded so it runs ONCE: rowData is also rewritten by the Fit button, and
+# without the guard every Fit would re-fire this and snap the selection back to
+# row 0. getRowId is set on the grid, so AG Grid preserves the user's selection
+# across rowData updates on its own.
 # ─────────────────────────────────────────────────────────────────────────────
 app.clientside_callback(
     """
     function(rowData) {
         if (!rowData || rowData.length === 0) {
+            return window.dash_clientside.no_update;
+        }
+        if (window.__sviInitialSelectDone) {
             return window.dash_clientside.no_update;
         }
         // Defer until the grid API is available, then select the first node.
@@ -564,7 +572,10 @@ app.clientside_callback(
             const api = gridDiv && gridDiv.gridApi;
             if (api) {
                 const node = api.getDisplayedRowAtIndex(0);
-                if (node) { node.setSelected(true); }
+                if (node) {
+                    node.setSelected(true);
+                    window.__sviInitialSelectDone = true;
+                }
             } else if (attempt < 20) {
                 setTimeout(function() { trySelect(attempt + 1); }, 100);
             }
