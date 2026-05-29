@@ -292,9 +292,9 @@ app.layout = html.Div(
                                         "paddingLeft": "12px",
                                     },
                                 },
-                                rowSelection="single",
                                 getRowId="params.data.expiry",
                                 dashGridOptions={
+                                    "rowSelection": "single",
                                     "rowHeight": 40,
                                     "headerHeight": 36,
                                     "suppressCellFocus": True,
