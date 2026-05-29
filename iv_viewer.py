@@ -14,9 +14,13 @@ import pandas as pd
 from scipy.optimize import minimize
 
 import dash
-from dash import dcc, html, Input, Output
+from dash import dcc, html, Input, Output, State
 import dash_ag_grid as dag
 import plotly.graph_objects as go
+
+# NOTE: dash-ag-grid has no "selectedRows" init prop. The first row is selected
+# on load via the clientside callback at the bottom of this file, and the
+# Python callback also falls back to the first expiry when nothing is selected.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Colour palette
@@ -33,26 +37,75 @@ TEXT_DIM = "#44506a"
 FONT     = "'IBM Plex Mono', 'Fira Code', monospace"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sample data
+# Raw SVI total-variance smile:  w(k) = a + b*(rho*(k-m) + sqrt((k-m)^2 + sigma^2))
+#   k = log(K / F),  w = sigma_IV^2 * T  (total variance)
+# Defined up here so the synthetic data generator can use it too.
 # ─────────────────────────────────────────────────────────────────────────────
+def svi_w(k, a, b, rho, m, sigma):
+    return a + b * (rho * (k - m) + np.sqrt((k - m) ** 2 + sigma ** 2))
+
+
+# Year-fraction to each expiry — also used by the fitter so that fitted
+# parameters live in the same total-variance space as the generating params.
+EXPIRY_T = {
+    "2026-06-20": 0.06,
+    "2026-07-18": 0.14,
+    "2026-09-19": 0.31,
+    "2026-12-18": 0.55,
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sample data — generated from a realistic SVI smile per expiry.
+#
+# Each expiry has its own "true" SVI parameters with a sensible term structure:
+#   * ATM variance grows with time (a increases),
+#   * skew (rho) is negative and flattens with maturity,
+#   * curvature (sigma) widens with maturity.
+# We evaluate the smile in TOTAL variance, convert to an annualised IV per
+# strike, add a little observation noise, then build a bid/ask around the mid.
+# Because the data is generated from SVI, the "Fit" button recovers parameters
+# close to these true values.
+# ─────────────────────────────────────────────────────────────────────────────
+TRUE_SVI = {
+    # exp label   :  a       b      rho     m       sigma
+    "2026-06-20": dict(a=0.0022, b=0.018, rho=-0.62, m=0.012, sigma=0.085),
+    "2026-07-18": dict(a=0.0050, b=0.030, rho=-0.55, m=0.015, sigma=0.105),
+    "2026-09-19": dict(a=0.0120, b=0.052, rho=-0.48, m=0.020, sigma=0.130),
+    "2026-12-18": dict(a=0.0230, b=0.078, rho=-0.42, m=0.028, sigma=0.160),
+}
+FORWARDS = {
+    "2026-06-20": 100.0,
+    "2026-07-18": 100.5,
+    "2026-09-19": 101.0,
+    "2026-12-18": 102.0,
+}
+
+
 def generate_sample_data() -> pd.DataFrame:
     rng = np.random.default_rng(42)
-    expiries = ["2026-06-20", "2026-07-18", "2026-09-19", "2026-12-18"]
     rows = []
-    for exp in expiries:
-        fwd = 100.0
+    for exp, p in TRUE_SVI.items():
+        T   = EXPIRY_T[exp]
+        fwd = FORWARDS[exp]
         strikes = np.arange(70, 136, 5, dtype=float)
-        for k in strikes:
-            m = (k - fwd) / fwd
-            base_iv = 0.20 + 0.15 * m**2 - 0.02 * m
+        for K in strikes:
+            k = np.log(K / fwd)                     # log-moneyness
+            w = max(svi_w(k, **p), 1e-6)            # total variance
+            iv_true = np.sqrt(w / T)                # annualised IV
+
+            # small multiplicative observation noise (~0.3% of IV)
+            iv_obs = max(iv_true * (1.0 + rng.normal(0, 0.003)), 0.01)
+
+            # bid/ask spread widens in the wings (lower liquidity there)
+            half_spread = 0.0025 + 0.01 * abs(k) + rng.uniform(0, 0.0015)
+
             for opt in ("call", "put"):
-                spread = rng.uniform(0.005, 0.015)
-                mid = max(0.05, base_iv + rng.normal(0, 0.003))
                 rows.append(dict(
-                    expiry=exp, strike=k, type=opt,
-                    iv_bid=round(mid - spread / 2, 4),
-                    iv_ask=round(mid + spread / 2, 4),
-                    iv_mid=round(mid, 4),
+                    expiry=exp, strike=K, type=opt,
+                    iv_bid=round(iv_obs - half_spread, 4),
+                    iv_ask=round(iv_obs + half_spread, 4),
+                    iv_mid=round(iv_obs, 4),
                     forward=fwd,
                 ))
     return pd.DataFrame(rows)
@@ -68,16 +121,12 @@ expiry_list = sorted(df["expiry"].unique())
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SVI fit  (raw parameterisation: a, b, rho, m, sigma)
-# Total variance w(k) = a + b*(rho*(k-m) + sqrt((k-m)^2 + sigma^2))
 # ─────────────────────────────────────────────────────────────────────────────
-def svi_w(k, a, b, rho, m, sigma):
-    return a + b * (rho * (k - m) + np.sqrt((k - m) ** 2 + sigma ** 2))
-
-
-def fit_svi(strikes: np.ndarray, iv_mid: np.ndarray, forward: float) -> dict:
-    """Fit SVI to mid IVs; returns parameter dict (or NaNs on failure)."""
+def fit_svi(strikes: np.ndarray, iv_mid: np.ndarray, forward: float,
+            T: float = 1.0) -> dict:
+    """Fit SVI to mid IVs in total-variance space (w = iv^2 * T)."""
     log_m = np.log(strikes / forward)
-    total_var = iv_mid ** 2
+    total_var = (iv_mid ** 2) * T
 
     def objective(p):
         a, b, rho, m, sigma = p
@@ -85,10 +134,10 @@ def fit_svi(strikes: np.ndarray, iv_mid: np.ndarray, forward: float) -> dict:
         return np.sum((w - total_var) ** 2)
 
     atm_var = float(np.interp(0.0, log_m, total_var))
-    x0 = [atm_var * 0.9, 0.1, -0.3, 0.0, 0.2]
-    bounds = [(1e-6, None), (1e-6, 2), (-0.999, 0.999), (-1, 1), (1e-4, 2)]
+    x0 = [atm_var * 0.9, max(atm_var, 0.01), -0.3, 0.0, 0.1]
+    bounds = [(1e-8, None), (1e-8, 5), (-0.999, 0.999), (-1, 1), (1e-4, 2)]
     res = minimize(objective, x0, bounds=bounds, method="L-BFGS-B",
-                   options={"maxiter": 2000, "ftol": 1e-12})
+                   options={"maxiter": 5000, "ftol": 1e-14})
 
     if res.success or res.fun < 1e-6:
         a, b, rho, m, sigma = res.x
@@ -105,7 +154,8 @@ def build_svi_table() -> list:
         calls = sub[(sub["type"] == "call") & (sub["strike"] >  fwd)]
         smile = pd.concat([puts, calls]).sort_values("strike")
 
-        p = fit_svi(smile["strike"].values, smile["iv_mid"].values, fwd)
+        p = fit_svi(smile["strike"].values, smile["iv_mid"].values, fwd,
+                    T=EXPIRY_T.get(exp, 1.0))
 
         def fmt(v, d=4):
             return round(float(v), d) if not np.isnan(v) else None
@@ -126,13 +176,28 @@ svi_rows = build_svi_table()
 # ─────────────────────────────────────────────────────────────────────────────
 # AG Grid column definitions
 # ─────────────────────────────────────────────────────────────────────────────
+_num_col = {
+    "type": "numericColumn",
+    "editable": True,
+    "width": 80,
+    "valueParser": {"function": "Number(params.newValue)"},
+    "cellStyle": {
+        "fontFamily": FONT,
+        "fontSize": "12px",
+        "color": "#f0d080",
+        "backgroundColor": "transparent",
+        "borderColor": BORDER,
+        "paddingLeft": "12px",
+    },
+}
+
 col_defs = [
-    {"field": "expiry", "headerName": "EXPIRY", "width": 118, "pinned": "left"},
-    {"field": "a",      "headerName": "a",      "width": 80, "type": "numericColumn"},
-    {"field": "b",      "headerName": "b",      "width": 80, "type": "numericColumn"},
-    {"field": "rho",    "headerName": "ρ",      "width": 80, "type": "numericColumn"},
-    {"field": "m",      "headerName": "m",      "width": 80, "type": "numericColumn"},
-    {"field": "sigma",  "headerName": "σ",      "width": 80, "type": "numericColumn"},
+    {"field": "expiry", "headerName": "EXPIRY", "width": 118, "pinned": "left", "editable": False},
+    {"field": "a",      "headerName": "a",      **_num_col},
+    {"field": "b",      "headerName": "b",      **_num_col},
+    {"field": "rho",    "headerName": "ρ",      **_num_col},
+    {"field": "m",      "headerName": "m",      **_num_col},
+    {"field": "sigma",  "headerName": "σ",      **_num_col},
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -182,9 +247,34 @@ app.layout = html.Div(
                     style={"width": "510px", "flexShrink": "0", "display": "flex",
                            "flexDirection": "column", "gap": "12px"},
                     children=[
-                        html.Div("SVI PARAMETERS",
-                                 style={"fontSize": "10px", "letterSpacing": "4px", "color": TEXT_DIM}),
+                        html.Div(
+                            style={"display": "flex", "alignItems": "center",
+                                   "justifyContent": "space-between"},
+                            children=[
+                                html.Div("SVI PARAMETERS",
+                                         style={"fontSize": "10px", "letterSpacing": "4px",
+                                                "color": TEXT_DIM}),
+                                html.Button(
+                                    "FIT SELECTED",
+                                    id="fit-btn",
+                                    n_clicks=0,
+                                    style={
+                                        "fontFamily": FONT,
+                                        "fontSize": "10px",
+                                        "letterSpacing": "2px",
+                                        "color": BG,
+                                        "backgroundColor": ACCENT,
+                                        "border": "none",
+                                        "borderRadius": "4px",
+                                        "padding": "6px 14px",
+                                        "cursor": "pointer",
+                                        "fontWeight": "700",
+                                    },
+                                ),
+                            ],
+                        ),
 
+                        # Grid wrapper — CSS vars propagate into ag-grid shadow DOM
                         html.Div(
                             dag.AgGrid(
                                 id="svi-grid",
@@ -203,7 +293,7 @@ app.layout = html.Div(
                                     },
                                 },
                                 rowSelection="single",
-                                selectedRows=[svi_rows[0]],
+                                getRowId="params.data.expiry",
                                 dashGridOptions={
                                     "rowHeight": 40,
                                     "headerHeight": 36,
@@ -246,7 +336,7 @@ app.layout = html.Div(
                                          style={"color": ACCENT, "letterSpacing": "3px",
                                                 "fontSize": "10px", "marginBottom": "8px"}),
                                 html.Div("w(k) = a + b · [ρ(k−m) + √((k−m)² + σ²)]"),
-                                html.Div("k = log(K/F)   w = σ²_IV",
+                                html.Div("k = log(K/F)   w = σ²_IV · T",
                                          style={"fontSize": "10px", "marginTop": "2px"}),
                                 html.Hr(style={"border": f"1px solid {BORDER}", "margin": "10px 0"}),
                                 html.Div([
@@ -308,31 +398,82 @@ app.layout = html.Div(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Callback
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def _smile_for(exp):
+    """Return (forward, puts, calls, smile) for an expiry."""
+    subset  = df[df["expiry"] == exp].copy()
+    forward = subset["forward"].iloc[0]
+    puts  = subset[(subset["type"] == "put")  & (subset["strike"] <= forward)].sort_values("strike")
+    calls = subset[(subset["type"] == "call") & (subset["strike"] >  forward)].sort_values("strike")
+    smile = pd.concat([puts, calls]).sort_values("strike")
+    return forward, puts, calls, smile
+
+
+def _selected_expiry(selected_rows):
+    return selected_rows[0]["expiry"] if selected_rows else expiry_list[0]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fit button → refit selected expiry, write params back into the grid.
+# Returns updated rowData; the chart callback then redraws from rowData.
+# ─────────────────────────────────────────────────────────────────────────────
+@app.callback(
+    Output("svi-grid", "rowData"),
+    Input("fit-btn", "n_clicks"),
+    State("svi-grid", "rowData"),
+    State("svi-grid", "selectedRows"),
+    prevent_initial_call=True,
+)
+def fit_selected(_n_clicks, row_data, selected_rows):
+    exp = _selected_expiry(selected_rows)
+    forward, _, _, smile = _smile_for(exp)
+    p = fit_svi(smile["strike"].values, smile["iv_mid"].values, forward,
+                T=EXPIRY_T.get(exp, 1.0))
+
+    def fmt(v, d=4):
+        return round(float(v), d) if not np.isnan(v) else None
+
+    for row in row_data:
+        if row["expiry"] == exp:
+            row["a"]     = fmt(p["a"])
+            row["b"]     = fmt(p["b"])
+            row["rho"]   = fmt(p["rho"], 3)
+            row["m"]     = fmt(p["m"], 4)
+            row["sigma"] = fmt(p["sigma"], 4)
+            break
+    return row_data
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Chart callback — redraws whenever the selection changes OR a cell is edited
+# OR the Fit button rewrites rowData. Parameters are read from the grid so that
+# manual edits are reflected immediately.
 # ─────────────────────────────────────────────────────────────────────────────
 @app.callback(
     Output("iv-chart",    "figure"),
     Output("chart-label", "children"),
     Input("svi-grid",     "selectedRows"),
+    Input("svi-grid",     "cellValueChanged"),
+    Input("svi-grid",     "rowData"),
 )
-def update_chart(selected_rows):
-    exp = selected_rows[0]["expiry"] if selected_rows else expiry_list[0]
+def update_chart(selected_rows, _cell_changed, row_data):
+    exp = _selected_expiry(selected_rows)
+    forward, puts, calls, smile = _smile_for(exp)
 
-    subset  = df[df["expiry"] == exp].copy()
-    forward = subset["forward"].iloc[0]
-
-    puts  = subset[(subset["type"] == "put")  & (subset["strike"] <= forward)].sort_values("strike")
-    calls = subset[(subset["type"] == "call") & (subset["strike"] >  forward)].sort_values("strike")
-    smile = pd.concat([puts, calls]).sort_values("strike")
-
-    # SVI curve
-    svi_p = next((r for r in svi_rows if r["expiry"] == exp), None)
+    # Read SVI params from the (possibly user-edited) grid row
+    svi_p = next((r for r in (row_data or []) if r["expiry"] == exp), None)
+    T = EXPIRY_T.get(exp, 1.0)
     k_grid = np.linspace(smile["strike"].min(), smile["strike"].max(), 300)
     log_k  = np.log(k_grid / forward)
     svi_iv = None
-    if svi_p and svi_p["a"] is not None:
-        w = svi_w(log_k, svi_p["a"], svi_p["b"], svi_p["rho"], svi_p["m"], svi_p["sigma"])
-        svi_iv = np.sqrt(np.maximum(w, 0))
+    if svi_p and svi_p.get("a") is not None:
+        try:
+            w = svi_w(log_k, float(svi_p["a"]), float(svi_p["b"]),
+                      float(svi_p["rho"]), float(svi_p["m"]), float(svi_p["sigma"]))
+            svi_iv = np.sqrt(np.maximum(w, 0) / T)   # total variance → annualised IV
+        except (TypeError, ValueError):
+            svi_iv = None
 
     fig = go.Figure()
 
@@ -404,6 +545,37 @@ def update_chart(selected_rows):
 
     label = f"SMILE  ·  {exp}  ·  FWD {forward:.4f}"
     return fig, label
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Select the first grid row on initial load (visual highlight).
+# The grid's "selectedRows" is read-only as a prop, so we set it via the
+# grid API from the client once the grid has rendered.
+# ─────────────────────────────────────────────────────────────────────────────
+app.clientside_callback(
+    """
+    function(rowData) {
+        if (!rowData || rowData.length === 0) {
+            return window.dash_clientside.no_update;
+        }
+        // Defer until the grid API is available, then select the first node.
+        const trySelect = function(attempt) {
+            const gridDiv = document.querySelector('#svi-grid');
+            const api = gridDiv && gridDiv.gridApi;
+            if (api) {
+                const node = api.getDisplayedRowAtIndex(0);
+                if (node) { node.setSelected(true); }
+            } else if (attempt < 20) {
+                setTimeout(function() { trySelect(attempt + 1); }, 100);
+            }
+        };
+        trySelect(0);
+        return window.dash_clientside.no_update;
+    }
+    """,
+    Output("svi-grid", "id"),
+    Input("svi-grid", "rowData"),
+)
 
 
 if __name__ == "__main__":
